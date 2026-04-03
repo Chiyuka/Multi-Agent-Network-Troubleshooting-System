@@ -204,14 +204,16 @@ _clf: RandomForestClassifier | None = None
 # Change the type hint for the client
 _gemini_model: ChatGoogleGenerativeAI | None = None
 
+    
 def init_system() -> None:
+    """Initialise all singletons. Call once before invoking the graph."""
     global _collection, _clf, _gemini_model
     _collection = build_vector_db()
     _clf = build_ml_model()
     
-    # Initialize Gemini (Ensure GOOGLE_API_KEY is in your .env)
+    # Update the model string here:
     _gemini_model = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash", 
+        model="models/gemini-1.5-flash",  # <--- Added 'models/' prefix
         temperature=0
     )
 
