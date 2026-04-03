@@ -45,18 +45,24 @@ from langchain_core.messages import HumanMessage, SystemMessage
 load_dotenv()
 
 # ── Model fallback chain ───────────────────────────────────────────────────────
-# Tried in order. All are free-tier eligible at aistudio.google.com.
-# Model names must match the google-genai v1beta SDK exactly (no "-latest" suffix).
-# If the first two are quota-exhausted today, the third uses a separate bucket.
-GEMINI_FALLBACK_MODELS = [
-    "gemini-2.0-flash-lite",  # lightest, most generous RPM quota
+# Two groups, each built with the correct API version for that model generation.
+#
+#   v1beta endpoint → gemini-2.x models  (langchain-google-genai default)
+#   v1     endpoint → gemini-1.5 models  (requires api_version override)
+#
+# Models are tried in order; the first one that responds becomes active.
+_MODELS_V1BETA = [
+    "gemini-2.0-flash-lite",  # lightest, highest free-tier RPM
     "gemini-2.0-flash",       # standard free tier
-    "gemini-1.5-flash",       # older generation, separate daily bucket
-    "gemini-1.5-flash-8b",    # smallest 1.5-gen model, distinct quota
 ]
+_MODELS_V1 = [
+    "gemini-1.5-flash",       # stable, separate daily quota bucket
+    "gemini-1.5-flash-8b",    # smallest / most quota-generous of the 1.5 family
+]
+GEMINI_FALLBACK_MODELS = _MODELS_V1BETA + _MODELS_V1  # for reference / logging
 
-# Errors that mean "this model is unavailable right now, try the next one"
-_SKIPPABLE_ERRORS = ("429", "RESOURCE_EXHAUSTED", "404", "NOT_FOUND")
+# Errors that mean "skip this model, try the next one"
+_SKIPPABLE = ("429", "RESOURCE_EXHAUSTED", "404", "NOT_FOUND")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -196,7 +202,7 @@ def build_ml_model() -> RandomForestClassifier:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5.  SINGLETONS
+# 5.  SINGLETONS & MODEL HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 _collection: chromadb.Collection | None = None
@@ -205,16 +211,25 @@ _gemini_model: ChatGoogleGenerativeAI | None = None
 _active_model_name: str = ""
 
 
-def _is_skippable(error: str) -> bool:
-    """Return True if this error means 'skip this model and try the next one'."""
-    return any(code in error for code in _SKIPPABLE_ERRORS)
+def _is_skippable(err: str) -> bool:
+    """True if the error means 'this model is unavailable – try the next one'."""
+    return any(code in err for code in _SKIPPABLE)
 
 
-def _build_gemini_client(model: str) -> ChatGoogleGenerativeAI:
+def _build_client(model: str) -> ChatGoogleGenerativeAI:
+    """
+    Build a ChatGoogleGenerativeAI client with the correct API version.
+
+    google-genai SDK 1.x defaults to v1beta, which only serves gemini-2.x.
+    The gemini-1.5 family is only available on the stable v1 endpoint.
+    We pass the api_version through client_args → http_options.
+    """
+    api_version = "v1" if model.startswith("gemini-1.5") else "v1beta"
     return ChatGoogleGenerativeAI(
         model=model,
         google_api_key=os.getenv("GOOGLE_API_KEY"),
         temperature=0,
+        client_args={"http_options": {"api_version": api_version}},
     )
 
 
@@ -223,8 +238,8 @@ def init_system() -> None:
     Initialise all singletons.
 
     Probes each model in GEMINI_FALLBACK_MODELS with a lightweight call.
-    Skips models that are quota-exhausted (429) OR not found (404) — both
-    are treated as 'unavailable, try next'. Fails fast on auth errors.
+    Skips models that are quota-exhausted (429) or not found (404).
+    Fails fast on auth errors (403) or unexpected exceptions.
     """
     global _collection, _clf, _gemini_model, _active_model_name
 
@@ -236,7 +251,7 @@ def init_system() -> None:
 
     for model_name in GEMINI_FALLBACK_MODELS:
         print(f"   Trying {model_name} ...", end=" ", flush=True)
-        client = _build_gemini_client(model_name)
+        client = _build_client(model_name)
         try:
             client.invoke([HumanMessage(content="ping")])
             _gemini_model = client
@@ -247,43 +262,42 @@ def init_system() -> None:
         except Exception as e:
             err = str(e)
             if _is_skippable(err):
-                # Quota exhausted OR model retired — both are recoverable
-                code = "quota exhausted" if "429" in err else "model not found"
-                print(f"⚠️  {code}, trying next...")
+                reason = "quota exhausted" if "429" in err else "model not found"
+                print(f"⚠️  {reason}, trying next...")
             else:
-                # Bad API key, network error, etc. — fail immediately
-                print(f"❌  fatal: {err[:120]}")
+                print(f"❌  fatal error: {err[:120]}")
                 raise
 
     raise RuntimeError(
         "\n\nAll Gemini models are unavailable right now.\n"
-        "Most likely cause: free-tier daily quota exhausted for all models.\n"
+        "Most likely cause: free-tier daily quota exhausted for all models.\n\n"
         "Options:\n"
-        "  1. Wait until midnight Pacific time for the quota to reset.\n"
-        "  2. Enable billing at console.cloud.google.com (still has a free tier).\n"
-        "  3. Create a second Google AI Studio project and generate a new API key.\n"
+        "  1. Wait for midnight Pacific time — quota resets daily.\n"
+        "  2. Go to https://aistudio.google.com/app/apikey, create a NEW project,\n"
+        "     generate a fresh API key, and update GOOGLE_API_KEY in your .env.\n"
+        "  3. Enable billing at console.cloud.google.com (free tier remains).\n"
     )
 
 
 def _invoke_with_fallback(messages: list) -> str:
     """
-    Call the active model. If it returns a skippable error mid-pipeline,
-    rotate to the next available model and retry.
+    Call the active model. Rotates to the next fallback if a skippable error
+    occurs mid-pipeline. Returns the response text as a plain string.
     """
     global _gemini_model, _active_model_name
 
-    candidates = [m for m in GEMINI_FALLBACK_MODELS if m != _active_model_name]
-    candidates.insert(0, _active_model_name)  # always try active model first
+    candidates = [_active_model_name] + [
+        m for m in GEMINI_FALLBACK_MODELS if m != _active_model_name
+    ]
 
     for model_name in candidates:
         if model_name != _active_model_name:
             print(f"   ↩ Rotating to fallback: {model_name}")
-            _gemini_model = _build_gemini_client(model_name)
+            _gemini_model = _build_client(model_name)
             _active_model_name = model_name
 
         try:
-            response = _gemini_model.invoke(messages)
-            return response.content
+            return _gemini_model.invoke(messages).content
         except Exception as e:
             err = str(e)
             if _is_skippable(err):
