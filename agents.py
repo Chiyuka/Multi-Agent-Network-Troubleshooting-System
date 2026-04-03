@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import textwrap
 from typing import Annotated, TypedDict
 import operator
@@ -34,7 +35,6 @@ from chromadb import Documents, EmbeddingFunction, Embeddings
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 # ── Scikit-learn ──────────────────────────────────────────────────────────────
-import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 
@@ -43,6 +43,14 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 load_dotenv()
+
+# ── Model fallback chain (tried in order if 429 is hit) ───────────────────────
+# All are free-tier eligible at aistudio.google.com – separate quota buckets.
+GEMINI_FALLBACK_MODELS = [
+    "gemini-2.0-flash-lite",   # fastest, most generous quota
+    "gemini-2.0-flash",        # slightly larger quota bucket
+    "gemini-1.5-flash-latest", # older generation, separate bucket
+]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -188,21 +196,92 @@ def build_ml_model() -> RandomForestClassifier:
 _collection: chromadb.Collection | None = None
 _clf: RandomForestClassifier | None = None
 _gemini_model: ChatGoogleGenerativeAI | None = None
+_active_model_name: str = ""
+
+
+def _build_gemini_client(model: str) -> ChatGoogleGenerativeAI:
+    return ChatGoogleGenerativeAI(
+        model=model,
+        google_api_key=os.getenv("GOOGLE_API_KEY"),
+        temperature=0,
+    )
 
 
 def init_system() -> None:
-    """Initialise all singletons. Call once before invoking the graph."""
-    global _collection, _clf, _gemini_model
+    """
+    Initialise all singletons.
+
+    Tries each model in GEMINI_FALLBACK_MODELS with a lightweight probe call.
+    The first model that responds without a 429 becomes the active client.
+    This makes the system resilient to per-model daily quota exhaustion.
+    """
+    global _collection, _clf, _gemini_model, _active_model_name
 
     _collection = build_vector_db()
     _clf = build_ml_model()
 
-    _gemini_model = ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash",
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
-        temperature=0,
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise EnvironmentError("GOOGLE_API_KEY not set. Add it to your .env file.")
+
+    for model_name in GEMINI_FALLBACK_MODELS:
+        print(f"   Trying model: {model_name} ...", end=" ", flush=True)
+        client = _build_gemini_client(model_name)
+        try:
+            # Lightweight probe – single token, minimal cost
+            client.invoke([HumanMessage(content="ping")])
+            _gemini_model = client
+            _active_model_name = model_name
+            print(f"✅")
+            print(f"✅ System initialised with {model_name}")
+            return
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                print(f"⚠️  quota exhausted, trying next...")
+            else:
+                # Non-quota error (bad key, network, etc.) – fail fast
+                print(f"❌  unexpected error: {err[:120]}")
+                raise
+
+    raise RuntimeError(
+        "All Gemini models in GEMINI_FALLBACK_MODELS are quota-exhausted. "
+        "Wait for the daily reset or add a billing account at console.cloud.google.com."
     )
-    print("✅ System initialised with gemini-2.0-flash")
+
+
+def _invoke_with_fallback(
+    messages: list,
+    retry_wait: int = 5,
+) -> str:
+    """
+    Invoke the active Gemini model. If a 429 occurs mid-pipeline (rare but
+    possible), rotate through the remaining fallback models before giving up.
+    Returns the response text as a plain string.
+    """
+    global _gemini_model, _active_model_name
+
+    remaining = [m for m in GEMINI_FALLBACK_MODELS if m != _active_model_name]
+    candidates = [_active_model_name] + remaining
+
+    for model_name in candidates:
+        if model_name != _active_model_name:
+            print(f"   ↩ Rotating to fallback model: {model_name}")
+            _gemini_model = _build_gemini_client(model_name)
+            _active_model_name = model_name
+
+        try:
+            response = _gemini_model.invoke(messages)
+            return response.content
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                print(f"   ⚠️ {model_name} exhausted mid-call, rotating...")
+                time.sleep(retry_wait)
+            else:
+                raise
+
+    raise RuntimeError("All fallback models exhausted during pipeline execution.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -331,14 +410,17 @@ def agent_coordinator(state: GraphState) -> dict:
         ## 6. Recommended Actions
     """).strip()
 
-    response = _gemini_model.invoke([
+    report_text = _invoke_with_fallback([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_prompt),
     ])
 
     return {
-        "final_report": response.content,
-        "evidence_log": ["[COORDINATOR] Report generated; grounded in RAG+ML context only."],
+        "final_report": report_text,
+        "evidence_log": [
+            f"[COORDINATOR] Report generated via {_active_model_name}; "
+            "grounded in RAG+ML context only."
+        ],
     }
 
 
