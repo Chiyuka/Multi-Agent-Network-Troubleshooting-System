@@ -38,6 +38,15 @@ from sklearn.ensemble import RandomForestClassifier
 # ── Anthropic (Agent C uses Claude as LLM) ────────────────────────────────────
 import anthropic
 
+# gemini api
+import os
+from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import SystemMessage, HumanMessage
+
+# Load variables from .env
+load_dotenv()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 0.  OFFLINE EMBEDDING FUNCTION  (TF-IDF, no model download required)
@@ -190,16 +199,30 @@ def build_ml_model() -> RandomForestClassifier:
 # Module-level singletons (initialised once in init_system)
 _collection: chromadb.Collection | None = None
 _clf: RandomForestClassifier | None = None
-_anthropic_client: anthropic.Anthropic | None = None
+#_anthropic_client: anthropic.Anthropic | None = None
 
+# Change the type hint for the client
+_gemini_model: ChatGoogleGenerativeAI | None = None
 
 def init_system() -> None:
-    """Initialise all singletons.  Call once before invoking the graph."""
+    global _collection, _clf, _gemini_model
+    _collection = build_vector_db()
+    _clf = build_ml_model()
+    
+    # Initialize Gemini (Ensure GOOGLE_API_KEY is in your .env)
+    _gemini_model = ChatGoogleGenerativeAI(
+        model="gemini-1.5-flash", 
+        temperature=0
+    )
+
+"""
+def init_system() -> None:
+    """"""Initialise all singletons.  Call once before invoking the graph.""""""
     global _collection, _clf, _anthropic_client
     _collection = build_vector_db()
     _clf = build_ml_model()
     _anthropic_client = anthropic.Anthropic()
-
+"""
 
 # ── Agent A: The Researcher ───────────────────────────────────────────────────
 
@@ -286,14 +309,18 @@ def agent_coordinator(state: GraphState) -> dict:
     Claude receives only the structured outputs of A and B; it cannot draw on
     external knowledge to fill gaps.
     """
-    assert _anthropic_client is not None, "Call init_system() first."
-
+    #assert _anthropic_client is not None, "Call init_system() first."
+    assert _gemini_model is not None, "Call init_system() first."
+    """
     rag_context = "\n\n".join(
         f"[DOC {i + 1}]: {doc}" for i, doc in enumerate(state["rag_docs"])
     )
     ml_context = json.dumps(state["ml_prediction"], indent=2)
+    """    
+    rag_context = "\n\n".join(f"[DOC {i + 1}]: {doc}" for i, doc in enumerate(state["rag_docs"]))
+    ml_context = json.dumps(state["ml_prediction"], indent=2)
 
-    system_prompt = textwrap.dedent("""
+    system_prompt = textwrap.dedent(f"""
         You are an Ericsson Site Acceptance Engineer writing an official report.
         You MUST follow these rules to ensure accuracy:
 
@@ -334,17 +361,26 @@ def agent_coordinator(state: GraphState) -> dict:
         ## 6. Recommended Actions
     """).strip()
 
+    """
     response = _anthropic_client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1024,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
     )
-
-    report_text: str = response.content[0].text
+    """
+    # The LangChain way to call Gemini:
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt),
+    ]
+    
+    response = _gemini_model.invoke(messages)
+    
+    #report_text: str = response.content[0].text
 
     return {
-        "final_report": report_text,
+        "final_report": response.content,
         "evidence_log": ["[COORDINATOR] Report generated; grounded in RAG+ML context only."],
     }
 
