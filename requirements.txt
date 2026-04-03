@@ -10,6 +10,8 @@
 langgraph>=1.1.4
 langchain-core>=1.2.0
 
+langchain-google-genai>=1.0.0
+
 # ── Vector database ───────────────────────────────────────────────────────────
 # Embeddings use offline TF-IDF (no model download needed).
 # Swap TFIDFEmbeddingFunction for sentence-transformers in production.
