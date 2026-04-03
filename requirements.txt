@@ -1,0 +1,27 @@
+# Multi-Agent Network Troubleshooting System
+# Ericsson AI Research Intern – Portfolio Project
+#
+# Install inside a venv:
+#   python -m venv venv
+#   source venv/bin/activate      # Windows: venv\Scripts\activate
+#   pip install -r requirements.txt
+
+# ── Agentic framework ─────────────────────────────────────────────────────────
+langgraph>=1.1.4
+langchain-core>=1.2.0
+
+# ── Vector database ───────────────────────────────────────────────────────────
+# Embeddings use offline TF-IDF (no model download needed).
+# Swap TFIDFEmbeddingFunction for sentence-transformers in production.
+chromadb>=1.5.0
+
+# ── Traditional ML ────────────────────────────────────────────────────────────
+scikit-learn>=1.4.0
+pandas>=2.0.0
+numpy>=1.26.0
+
+# ── LLM API ───────────────────────────────────────────────────────────────────
+anthropic>=0.30.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
