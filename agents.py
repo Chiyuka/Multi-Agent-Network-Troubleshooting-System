@@ -6,7 +6,7 @@ Author: ELTE CS Student
 Architecture:
   Agent A (Researcher)   → ChromaDB RAG query  (TF-IDF embeddings, fully offline)
   Agent B (Analyst)      → Scikit-learn Random Forest congestion predictor
-  Agent C (Coordinator)  → Claude writes the final Site Acceptance Report
+  Agent C (Coordinator)  → Gemini writes the final Site Acceptance Report
 
 Hallucination-prevention strategy:
   1. Agent A returns VERBATIM chunks from ChromaDB – no LLM involved.
@@ -18,14 +18,17 @@ Hallucination-prevention strategy:
 from __future__ import annotations
 
 import json
+import os
 import textwrap
-from typing import TypedDict, Annotated
+from typing import Annotated, TypedDict
 import operator
 
-# ── LangGraph ─────────────────────────────────────────────────────────────────
-from langgraph.graph import StateGraph, END
+from dotenv import load_dotenv
 
-# ── ChromaDB (with offline TF-IDF embedding function) ─────────────────────────
+# ── LangGraph ─────────────────────────────────────────────────────────────────
+from langgraph.graph import END, StateGraph
+
+# ── ChromaDB (offline TF-IDF embedding function – no model download) ──────────
 import chromadb
 from chromadb import Documents, EmbeddingFunction, Embeddings
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -35,16 +38,10 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 
-# ── Anthropic (Agent C uses Claude as LLM) ────────────────────────────────────
-#import anthropic
-
-# gemini api
-import os
-from dotenv import load_dotenv
+# ── Gemini via LangChain ──────────────────────────────────────────────────────
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
-# Load variables from .env
 load_dotenv()
 
 
@@ -55,12 +52,11 @@ load_dotenv()
 class TFIDFEmbeddingFunction(EmbeddingFunction):
     """
     Lightweight offline embedding function backed by scikit-learn TF-IDF.
-    Suitable for small document sets where semantic accuracy matters less
-    than portability and zero external dependencies.
-    Replace with sentence-transformers or OpenAI embeddings in production.
+    Suitable for small document sets where portability matters most.
+    Swap for sentence-transformers or Google text-embedding-004 in production.
     """
 
-    def __init__(self, corpus: list[str]):
+    def __init__(self, corpus: list[str]) -> None:
         self._vectorizer = TfidfVectorizer(
             ngram_range=(1, 2),
             sublinear_tf=True,
@@ -70,7 +66,6 @@ class TFIDFEmbeddingFunction(EmbeddingFunction):
 
     def __call__(self, input: Documents) -> Embeddings:  # noqa: A002
         matrix = self._vectorizer.transform(input)
-        # ChromaDB expects plain Python lists of floats
         return matrix.toarray().tolist()
 
 
@@ -81,12 +76,10 @@ class TFIDFEmbeddingFunction(EmbeddingFunction):
 class GraphState(TypedDict):
     site_id: str
     query: str
-    # outputs accumulated by each agent
-    rag_docs: Annotated[list[str], operator.add]   # Agent A fills this
-    ml_prediction: dict                             # Agent B fills this
-    final_report: str                               # Agent C fills this
-    # audit trail – every grounded fact is logged here
-    evidence_log: Annotated[list[str], operator.add]
+    rag_docs: Annotated[list[str], operator.add]    # filled by Agent A
+    ml_prediction: dict                              # filled by Agent B
+    final_report: str                                # filled by Agent C
+    evidence_log: Annotated[list[str], operator.add] # accumulated by all agents
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -136,15 +129,14 @@ MOCK_SITE_DOCS = [
 
 MOCK_CSV_DATA = pd.DataFrame(
     {
-        "active_ue":           [120, 450,  980, 1240, 300,  870, 1100, 200, 560, 1050],
-        "dl_throughput_mbps":  [480, 390,  310,  260, 450,  330,  280, 470, 370,  295],
-        "packet_loss_pct":     [0.1, 0.3,  0.8,  1.4, 0.2,  0.7,  1.2, 0.1, 0.4,  1.1],
-        "latency_p99_ms":      [ 12,  15,   19,   25,  13,   18,   23,  11,  16,   22],
-        "congested":           [  0,   0,    0,    1,   0,    0,    1,   0,   0,    1],
+        "active_ue":          [120, 450,  980, 1240, 300,  870, 1100, 200, 560, 1050],
+        "dl_throughput_mbps": [480, 390,  310,  260, 450,  330,  280, 470, 370,  295],
+        "packet_loss_pct":    [0.1, 0.3,  0.8,  1.4, 0.2,  0.7,  1.2, 0.1, 0.4,  1.1],
+        "latency_p99_ms":     [ 12,  15,   19,   25,  13,   18,   23,  11,  16,   22],
+        "congested":          [  0,   0,    0,    1,   0,    0,    1,   0,   0,    1],
     }
 )
 
-# Peak-hour snapshot used for inference
 LIVE_KPI = {
     "active_ue":          1240,
     "dl_throughput_mbps":  260,
@@ -158,14 +150,11 @@ LIVE_KPI = {
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_vector_db() -> chromadb.Collection:
-    """
-    Fit TF-IDF on the corpus first, then populate an in-memory ChromaDB
-    collection.  No network access required.
-    """
+    """Fit TF-IDF on the corpus, then load it into an in-memory ChromaDB collection."""
     corpus = [d["text"] for d in MOCK_SITE_DOCS]
     ef = TFIDFEmbeddingFunction(corpus)
 
-    client = chromadb.Client()   # ephemeral / in-memory
+    client = chromadb.Client()
     collection = client.get_or_create_collection(
         name="ericsson_site_docs",
         embedding_function=ef,
@@ -184,7 +173,7 @@ def build_vector_db() -> chromadb.Collection:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_ml_model() -> RandomForestClassifier:
-    """Train a Random Forest on mock KPI data."""
+    """Train a Random Forest classifier on mock KPI data."""
     X = MOCK_CSV_DATA[["active_ue", "dl_throughput_mbps", "packet_loss_pct", "latency_p99_ms"]]
     y = MOCK_CSV_DATA["congested"]
     clf = RandomForestClassifier(n_estimators=50, random_state=42)
@@ -193,38 +182,32 @@ def build_ml_model() -> RandomForestClassifier:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5.  AGENT NODES
+# 5.  SINGLETONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Module-level singletons (initialised once in init_system)
 _collection: chromadb.Collection | None = None
 _clf: RandomForestClassifier | None = None
-#_anthropic_client: anthropic.Anthropic | None = None
-
-# Change the type hint for the client
 _gemini_model: ChatGoogleGenerativeAI | None = None
 
-    
+
 def init_system() -> None:
     """Initialise all singletons. Call once before invoking the graph."""
     global _collection, _clf, _gemini_model
-    _collection = build_vector_db()
-    _clf = build_ml_model()
-    
-    # Try the most specific, stable version string
-    _gemini_model = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash-latest", # <--- Changed to 'latest'
-        temperature=0
-    )
 
-"""
-def init_system() -> None:
-    """"""Initialise all singletons.  Call once before invoking the graph.""""""
-    global _collection, _clf, _anthropic_client
     _collection = build_vector_db()
     _clf = build_ml_model()
-    _anthropic_client = anthropic.Anthropic()
-"""
+
+    _gemini_model = ChatGoogleGenerativeAI(
+        model="gemini-2.0-flash",
+        google_api_key=os.getenv("GOOGLE_API_KEY"),
+        temperature=0,
+    )
+    print("✅ System initialised with gemini-2.0-flash")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6.  AGENT NODES
+# ══════════════════════════════════════════════════════════════════════════════
 
 # ── Agent A: The Researcher ───────────────────────────────────────────────────
 
@@ -234,23 +217,17 @@ def agent_researcher(state: GraphState) -> dict:
 
     HALLUCINATION PREVENTION
     ────────────────────────
-    No LLM is invoked.  This node performs a cosine-similarity search over
-    TF-IDF vectors and returns the raw document strings verbatim.  The text
-    that reaches Agent C is literal source material, not generated content.
+    No LLM is invoked. Cosine-similarity search over TF-IDF vectors returns
+    raw document strings verbatim – literal source material, not generated text.
     """
     assert _collection is not None, "Call init_system() first."
 
-    results = _collection.query(
-        query_texts=[state["query"]],
-        n_results=4,
-    )
+    results = _collection.query(query_texts=[state["query"]], n_results=4)
     docs: list[str] = results["documents"][0]
-
-    evidence = [f"[RAG] Retrieved chunk: '{d[:80]}...'" for d in docs]
 
     return {
         "rag_docs": docs,
-        "evidence_log": evidence,
+        "evidence_log": [f"[RAG] Retrieved chunk: '{d[:80]}...'" for d in docs],
     }
 
 
@@ -258,18 +235,16 @@ def agent_researcher(state: GraphState) -> dict:
 
 def agent_analyst(state: GraphState) -> dict:
     """
-    Runs the Scikit-learn Random Forest to predict network congestion.
+    Predicts network congestion with a Scikit-learn Random Forest.
 
     HALLUCINATION PREVENTION
     ────────────────────────
-    The prediction is 100 % deterministic – a numerical ML inference, not a
-    language model generation.  The confidence value is a calibrated ensemble
-    probability from predict_proba(), not a linguistic hedge.
+    100 % deterministic ML inference – no language model, no sampling,
+    no token generation. Confidence is a calibrated ensemble probability.
     """
     assert _clf is not None, "Call init_system() first."
 
     live_df = pd.DataFrame([LIVE_KPI])
-
     prediction = int(_clf.predict(live_df)[0])
     confidence = float(_clf.predict_proba(live_df)[0][prediction])
     label = "CONGESTED" if prediction == 1 else "NORMAL"
@@ -284,14 +259,12 @@ def agent_analyst(state: GraphState) -> dict:
         "feature_importances": {k: round(v, 3) for k, v in importances.items()},
     }
 
-    evidence = [
-        f"[ML] Random Forest prediction: {label} (confidence {confidence:.1%})",
-        f"[ML] Top feature: {max(importances, key=importances.get)}",
-    ]
-
     return {
         "ml_prediction": ml_result,
-        "evidence_log": evidence,
+        "evidence_log": [
+            f"[ML] Random Forest prediction: {label} (confidence {confidence:.1%})",
+            f"[ML] Top feature: {max(importances, key=importances.get)}",
+        ],
     }
 
 
@@ -303,26 +276,21 @@ def agent_coordinator(state: GraphState) -> dict:
 
     HALLUCINATION PREVENTION
     ────────────────────────
-    The system prompt enforces four hard rules:
+    System prompt enforces four hard rules:
       RULE 1 – GROUNDING  : every fact must cite [RAG] or [ML].
       RULE 2 – GAPS       : missing data → '⚠️ DATA NOT AVAILABLE', never inferred.
       RULE 3 – CITATIONS  : inline source tag after every factual sentence.
-      RULE 4 – VERDICT    : Pass/Fail derived only from ML label + RAG criteria.
-    Claude receives only the structured outputs of A and B; it cannot draw on
-    external knowledge to fill gaps.
+      RULE 4 – VERDICT    : PASS/FAIL derived only from ML label + RAG criteria.
+    Gemini receives only the structured outputs of A and B as context.
     """
-    #assert _anthropic_client is not None, "Call init_system() first."
     assert _gemini_model is not None, "Call init_system() first."
-    """
+
     rag_context = "\n\n".join(
         f"[DOC {i + 1}]: {doc}" for i, doc in enumerate(state["rag_docs"])
     )
     ml_context = json.dumps(state["ml_prediction"], indent=2)
-    """    
-    rag_context = "\n\n".join(f"[DOC {i + 1}]: {doc}" for i, doc in enumerate(state["rag_docs"]))
-    ml_context = json.dumps(state["ml_prediction"], indent=2)
 
-    system_prompt = textwrap.dedent(f"""
+    system_prompt = textwrap.dedent("""
         You are an Ericsson Site Acceptance Engineer writing an official report.
         You MUST follow these rules to ensure accuracy:
 
@@ -363,23 +331,10 @@ def agent_coordinator(state: GraphState) -> dict:
         ## 6. Recommended Actions
     """).strip()
 
-    """
-    response = _anthropic_client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1024,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-    """
-    # The LangChain way to call Gemini:
-    messages = [
+    response = _gemini_model.invoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_prompt),
-    ]
-    
-    response = _gemini_model.invoke(messages)
-    
-    #report_text: str = response.content[0].text
+    ])
 
     return {
         "final_report": response.content,
@@ -388,13 +343,12 @@ def agent_coordinator(state: GraphState) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6.  LANGGRAPH  –  Graph Definition
+# 7.  LANGGRAPH GRAPH DEFINITION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_graph():
     """
-    Topology:
-        START → researcher → analyst → coordinator → END
+    Topology:  START → researcher → analyst → coordinator → END
 
     Sequential chaining ensures every downstream agent receives the full
     accumulated state produced by all upstream agents before executing.
@@ -414,7 +368,7 @@ def build_graph():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7.  ENTRY POINT
+# 8.  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_pipeline(site_id: str = "ERB-BUD-042") -> GraphState:
@@ -434,13 +388,18 @@ def run_pipeline(site_id: str = "ERB-BUD-042") -> GraphState:
 
 
 if __name__ == "__main__":
-    state = run_pipeline()
+    try:
+        state = run_pipeline()
 
-    print("\n" + "=" * 72)
-    print("FINAL SITE ACCEPTANCE REPORT")
-    print("=" * 72)
-    print(state["final_report"])
+        print("\n" + "=" * 72)
+        print("FINAL SITE ACCEPTANCE REPORT")
+        print("=" * 72)
+        print(state["final_report"])
 
-    print("\n--- EVIDENCE AUDIT TRAIL ---")
-    for entry in state["evidence_log"]:
-        print(" •", entry)
+        print("\n--- EVIDENCE AUDIT TRAIL ---")
+        for entry in state["evidence_log"]:
+            print(" •", entry)
+
+    except Exception as e:
+        print(f"\n❌ Pipeline failed: {e}")
+        raise
