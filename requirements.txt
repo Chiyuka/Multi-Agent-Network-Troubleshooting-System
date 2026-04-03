@@ -15,7 +15,10 @@ langchain-google-genai>=1.0.0
 # ── Vector database ───────────────────────────────────────────────────────────
 # Embeddings use offline TF-IDF (no model download needed).
 # Swap TFIDFEmbeddingFunction for sentence-transformers in production.
-chromadb>=1.5.0
+#chromadb>=1.5.0
+
+# ── Vector Database (RAG) ─────────────────────────────────────────────────────
+chromadb>=0.4.0
 
 # ── Traditional ML ────────────────────────────────────────────────────────────
 scikit-learn>=1.4.0
@@ -23,7 +26,10 @@ pandas>=2.0.0
 numpy>=1.26.0
 
 # ── LLM API ───────────────────────────────────────────────────────────────────
-anthropic>=0.30.0
+#anthropic>=0.30.0
+
+
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0
+
