@@ -36,7 +36,7 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 
 # ── Anthropic (Agent C uses Claude as LLM) ────────────────────────────────────
-import anthropic
+#import anthropic
 
 # gemini api
 import os
@@ -211,9 +211,9 @@ def init_system() -> None:
     _collection = build_vector_db()
     _clf = build_ml_model()
     
-    # Update the model string here:
+    # Try the most specific, stable version string
     _gemini_model = ChatGoogleGenerativeAI(
-        model="models/gemini-1.5-flash",  # <--- Added 'models/' prefix
+        model="gemini-1.5-flash-latest", # <--- Changed to 'latest'
         temperature=0
     )
 
