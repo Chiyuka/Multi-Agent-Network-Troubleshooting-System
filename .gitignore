@@ -52,4 +52,5 @@ models/
 # ── Logs & outputs ────────────────────────────────────────────────────────────
 *.log
 reports/
-outputs/test_key.py
+
+test_key.py
