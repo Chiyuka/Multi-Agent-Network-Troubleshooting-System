@@ -418,3 +418,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n❌ Pipeline failed: {e}")
         raise
+    
+'''
+this is the final updated: 08/04/2026 (improve later)
+'''
