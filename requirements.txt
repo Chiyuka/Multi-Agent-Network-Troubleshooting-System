@@ -10,12 +10,12 @@
 langgraph>=1.1.4
 langchain-core>=1.2.0
 
-# ── LLM – Gemini (free tier available at aistudio.google.com) ─────────────────
-langchain-google-genai>=4.0.0
+# ── LLM – DeepSeek (OpenAI-compatible API, free tier available) ───────────────
+# DeepSeek uses the OpenAI wire protocol, so langchain-openai works directly.
+# No separate DeepSeek SDK needed.
+langchain-openai>=0.1.0
 
 # ── Vector database ───────────────────────────────────────────────────────────
-# Embeddings use offline TF-IDF (no model download needed).
-# Swap TFIDFEmbeddingFunction for sentence-transformers in production.
 chromadb>=1.5.0
 
 # ── Traditional ML ────────────────────────────────────────────────────────────

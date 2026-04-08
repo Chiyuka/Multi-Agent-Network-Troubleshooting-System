@@ -6,7 +6,7 @@ Author: ELTE CS Student
 Architecture:
   Agent A (Researcher)   → ChromaDB RAG query  (TF-IDF embeddings, fully offline)
   Agent B (Analyst)      → Scikit-learn Random Forest congestion predictor
-  Agent C (Coordinator)  → Gemini writes the final Site Acceptance Report
+  Agent C (Coordinator)  → DeepSeek writes the final Site Acceptance Report
 
 Hallucination-prevention strategy:
   1. Agent A returns VERBATIM chunks from ChromaDB – no LLM involved.
@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 import textwrap
 from typing import Annotated, TypedDict
 import operator
@@ -38,31 +37,17 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 
-# ── Gemini via LangChain ──────────────────────────────────────────────────────
-from langchain_google_genai import ChatGoogleGenerativeAI
+# ── DeepSeek via LangChain (OpenAI-compatible API) ────────────────────────────
+# DeepSeek exposes an OpenAI-compatible endpoint, so ChatOpenAI works out of
+# the box — no extra SDK required. Just point base_url at DeepSeek's server.
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 load_dotenv()
 
-# ── Model fallback chain ───────────────────────────────────────────────────────
-# Two groups, each built with the correct API version for that model generation.
-#
-#   v1beta endpoint → gemini-2.x models  (langchain-google-genai default)
-#   v1     endpoint → gemini-1.5 models  (requires api_version override)
-#
-# Models are tried in order; the first one that responds becomes active.
-_MODELS_V1BETA = [
-    "gemini-2.0-flash-lite",  # lightest, highest free-tier RPM
-    "gemini-2.0-flash",       # standard free tier
-]
-_MODELS_V1 = [
-    "gemini-1.5-flash",       # stable, separate daily quota bucket
-    "gemini-1.5-flash-8b",    # smallest / most quota-generous of the 1.5 family
-]
-GEMINI_FALLBACK_MODELS = _MODELS_V1BETA + _MODELS_V1  # for reference / logging
-
-# Errors that mean "skip this model, try the next one"
-_SKIPPABLE = ("429", "RESOURCE_EXHAUSTED", "404", "NOT_FOUND")
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_MODEL    = "deepseek-chat"   # points to DeepSeek-V3; swap for
+                                      # "deepseek-reasoner" (R1) if preferred
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -73,7 +58,7 @@ class TFIDFEmbeddingFunction(EmbeddingFunction):
     """
     Lightweight offline embedding function backed by scikit-learn TF-IDF.
     Suitable for small document sets where portability matters most.
-    Swap for sentence-transformers or Google text-embedding-004 in production.
+    Swap for sentence-transformers or an embedding API in production.
     """
 
     def __init__(self, corpus: list[str]) -> None:
@@ -202,111 +187,36 @@ def build_ml_model() -> RandomForestClassifier:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5.  SINGLETONS & MODEL HELPERS
+# 5.  SINGLETONS
 # ══════════════════════════════════════════════════════════════════════════════
 
 _collection: chromadb.Collection | None = None
 _clf: RandomForestClassifier | None = None
-_gemini_model: ChatGoogleGenerativeAI | None = None
-_active_model_name: str = ""
-
-
-def _is_skippable(err: str) -> bool:
-    """True if the error means 'this model is unavailable – try the next one'."""
-    return any(code in err for code in _SKIPPABLE)
-
-
-def _build_client(model: str) -> ChatGoogleGenerativeAI:
-    """
-    Build a ChatGoogleGenerativeAI client with the correct API version.
-
-    google-genai SDK 1.x defaults to v1beta, which only serves gemini-2.x.
-    The gemini-1.5 family is only available on the stable v1 endpoint.
-    We pass the api_version through client_args → http_options.
-    """
-    api_version = "v1" if model.startswith("gemini-1.5") else "v1beta"
-    return ChatGoogleGenerativeAI(
-        model=model,
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
-        temperature=0,
-        client_args={"http_options": {"api_version": api_version}},
-    )
+_llm: ChatOpenAI | None = None
 
 
 def init_system() -> None:
-    """
-    Initialise all singletons.
-
-    Probes each model in GEMINI_FALLBACK_MODELS with a lightweight call.
-    Skips models that are quota-exhausted (429) or not found (404).
-    Fails fast on auth errors (403) or unexpected exceptions.
-    """
-    global _collection, _clf, _gemini_model, _active_model_name
+    """Initialise all singletons. Call once before invoking the graph."""
+    global _collection, _clf, _llm
 
     _collection = build_vector_db()
     _clf = build_ml_model()
 
-    if not os.getenv("GOOGLE_API_KEY"):
-        raise EnvironmentError("GOOGLE_API_KEY not set. Add it to your .env file.")
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise EnvironmentError(
+            "DEEPSEEK_API_KEY not set.\n"
+            "Get a free key at https://platform.deepseek.com and add it to .env"
+        )
 
-    for model_name in GEMINI_FALLBACK_MODELS:
-        print(f"   Trying {model_name} ...", end=" ", flush=True)
-        client = _build_client(model_name)
-        try:
-            client.invoke([HumanMessage(content="ping")])
-            _gemini_model = client
-            _active_model_name = model_name
-            print("✅")
-            print(f"✅ System initialised with {model_name}")
-            return
-        except Exception as e:
-            err = str(e)
-            if _is_skippable(err):
-                reason = "quota exhausted" if "429" in err else "model not found"
-                print(f"⚠️  {reason}, trying next...")
-            else:
-                print(f"❌  fatal error: {err[:120]}")
-                raise
-
-    raise RuntimeError(
-        "\n\nAll Gemini models are unavailable right now.\n"
-        "Most likely cause: free-tier daily quota exhausted for all models.\n\n"
-        "Options:\n"
-        "  1. Wait for midnight Pacific time — quota resets daily.\n"
-        "  2. Go to https://aistudio.google.com/app/apikey, create a NEW project,\n"
-        "     generate a fresh API key, and update GOOGLE_API_KEY in your .env.\n"
-        "  3. Enable billing at console.cloud.google.com (free tier remains).\n"
+    _llm = ChatOpenAI(
+        model=DEEPSEEK_MODEL,
+        openai_api_key=api_key,
+        openai_api_base=DEEPSEEK_BASE_URL,
+        temperature=0,
+        max_tokens=1024,
     )
-
-
-def _invoke_with_fallback(messages: list) -> str:
-    """
-    Call the active model. Rotates to the next fallback if a skippable error
-    occurs mid-pipeline. Returns the response text as a plain string.
-    """
-    global _gemini_model, _active_model_name
-
-    candidates = [_active_model_name] + [
-        m for m in GEMINI_FALLBACK_MODELS if m != _active_model_name
-    ]
-
-    for model_name in candidates:
-        if model_name != _active_model_name:
-            print(f"   ↩ Rotating to fallback: {model_name}")
-            _gemini_model = _build_client(model_name)
-            _active_model_name = model_name
-
-        try:
-            return _gemini_model.invoke(messages).content
-        except Exception as e:
-            err = str(e)
-            if _is_skippable(err):
-                print(f"   ⚠️ {model_name} unavailable mid-call, rotating...")
-                time.sleep(2)
-            else:
-                raise
-
-    raise RuntimeError("All fallback models exhausted during pipeline execution.")
+    print(f"✅ System initialised with DeepSeek ({DEEPSEEK_MODEL})")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -379,9 +289,9 @@ def agent_coordinator(state: GraphState) -> dict:
       RULE 2 – GAPS       : missing data → '⚠️ DATA NOT AVAILABLE', never inferred.
       RULE 3 – CITATIONS  : inline source tag after every factual sentence.
       RULE 4 – VERDICT    : PASS/FAIL derived only from ML label + RAG criteria.
-    Gemini receives only the structured outputs of A and B as context.
+    DeepSeek receives only the structured outputs of A and B as context.
     """
-    assert _gemini_model is not None, "Call init_system() first."
+    assert _llm is not None, "Call init_system() first."
 
     rag_context = "\n\n".join(
         f"[DOC {i + 1}]: {doc}" for i, doc in enumerate(state["rag_docs"])
@@ -429,15 +339,15 @@ def agent_coordinator(state: GraphState) -> dict:
         ## 6. Recommended Actions
     """).strip()
 
-    report_text = _invoke_with_fallback([
+    response = _llm.invoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_prompt),
     ])
 
     return {
-        "final_report": report_text,
+        "final_report": response.content,
         "evidence_log": [
-            f"[COORDINATOR] Report generated via {_active_model_name}; "
+            f"[COORDINATOR] Report generated via DeepSeek ({DEEPSEEK_MODEL}); "
             "grounded in RAG+ML context only."
         ],
     }
