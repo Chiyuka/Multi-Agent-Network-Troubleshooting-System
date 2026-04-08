@@ -6,7 +6,7 @@ Author: ELTE CS Student
 Architecture:
   Agent A (Researcher)   → ChromaDB RAG query  (TF-IDF embeddings, fully offline)
   Agent B (Analyst)      → Scikit-learn Random Forest congestion predictor
-  Agent C (Coordinator)  → DeepSeek writes the final Site Acceptance Report
+  Agent C (Coordinator)  → Groq/Llama-3 writes the final Site Acceptance Report
 
 Hallucination-prevention strategy:
   1. Agent A returns VERBATIM chunks from ChromaDB – no LLM involved.
@@ -37,17 +37,19 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 
-# ── DeepSeek via LangChain (OpenAI-compatible API) ────────────────────────────
-# DeepSeek exposes an OpenAI-compatible endpoint, so ChatOpenAI works out of
-# the box — no extra SDK required. Just point base_url at DeepSeek's server.
+# ── Groq via LangChain (OpenAI-compatible API, genuine free tier) ─────────────
+# Groq exposes an OpenAI-compatible endpoint — no separate SDK needed.
+# Free tier: https://console.groq.com (no credit card required)
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 load_dotenv()
 
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_MODEL    = "deepseek-chat"   # points to DeepSeek-V3; swap for
-                                      # "deepseek-reasoner" (R1) if preferred
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_MODEL    = "llama-3.3-70b-versatile"   # Best free model on Groq.
+                                              # Alternatives (all free):
+                                              #   "llama-3.1-8b-instant"  (faster)
+                                              #   "mixtral-8x7b-32768"    (long ctx)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -58,7 +60,7 @@ class TFIDFEmbeddingFunction(EmbeddingFunction):
     """
     Lightweight offline embedding function backed by scikit-learn TF-IDF.
     Suitable for small document sets where portability matters most.
-    Swap for sentence-transformers or an embedding API in production.
+    Swap for sentence-transformers in production.
     """
 
     def __init__(self, corpus: list[str]) -> None:
@@ -155,7 +157,7 @@ LIVE_KPI = {
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_vector_db() -> chromadb.Collection:
-    """Fit TF-IDF on the corpus, then load it into an in-memory ChromaDB collection."""
+    """Fit TF-IDF on the corpus, then load into an in-memory ChromaDB collection."""
     corpus = [d["text"] for d in MOCK_SITE_DOCS]
     ef = TFIDFEmbeddingFunction(corpus)
 
@@ -202,21 +204,23 @@ def init_system() -> None:
     _collection = build_vector_db()
     _clf = build_ml_model()
 
-    api_key = os.getenv("DEEPSEEK_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise EnvironmentError(
-            "DEEPSEEK_API_KEY not set.\n"
-            "Get a free key at https://platform.deepseek.com and add it to .env"
+            "GROQ_API_KEY not set.\n"
+            "  1. Sign up free (no card) at https://console.groq.com\n"
+            "  2. Create an API key\n"
+            "  3. Add GROQ_API_KEY=gsk_... to your .env file"
         )
 
     _llm = ChatOpenAI(
-        model=DEEPSEEK_MODEL,
+        model=GROQ_MODEL,
         openai_api_key=api_key,
-        openai_api_base=DEEPSEEK_BASE_URL,
+        openai_api_base=GROQ_BASE_URL,
         temperature=0,
         max_tokens=1024,
     )
-    print(f"✅ System initialised with DeepSeek ({DEEPSEEK_MODEL})")
+    print(f"✅ System initialised with Groq ({GROQ_MODEL})")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -289,7 +293,7 @@ def agent_coordinator(state: GraphState) -> dict:
       RULE 2 – GAPS       : missing data → '⚠️ DATA NOT AVAILABLE', never inferred.
       RULE 3 – CITATIONS  : inline source tag after every factual sentence.
       RULE 4 – VERDICT    : PASS/FAIL derived only from ML label + RAG criteria.
-    DeepSeek receives only the structured outputs of A and B as context.
+    The LLM receives only the structured outputs of A and B as context.
     """
     assert _llm is not None, "Call init_system() first."
 
@@ -347,7 +351,7 @@ def agent_coordinator(state: GraphState) -> dict:
     return {
         "final_report": response.content,
         "evidence_log": [
-            f"[COORDINATOR] Report generated via DeepSeek ({DEEPSEEK_MODEL}); "
+            f"[COORDINATOR] Report generated via Groq ({GROQ_MODEL}); "
             "grounded in RAG+ML context only."
         ],
     }
